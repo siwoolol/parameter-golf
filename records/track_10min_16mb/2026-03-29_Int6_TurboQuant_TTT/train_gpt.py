@@ -385,6 +385,18 @@ CONTROL_TENSOR_NAME_PATTERNS = (
     "skip_weights", "smear", "ve_layer_scales", "ve_shared.scale",
 )
 
+class BigramHash(nn.Module):
+    def __init__(self, vocab_size: int, hash_size: int, dim: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.hash_size = hash_size
+        self.embed = nn.Embedding(hash_size, dim)
+        nn.init.normal_(self.embed.weight, std=0.01)
+
+    def forward(self, x: Tensor) -> Tensor:
+        prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        hashed = (prev * self.vocab_size + x) % self.hash_size
+        return self.embed(hashed)
 
 class GPT(nn.Module):
     def __init__(
@@ -420,6 +432,7 @@ class GPT(nn.Module):
 
         # === Token Embedding ===
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram = BigramHash(vocab_size, bigram_vocab_size, bigram_dim) if bigram_vocab_size > 0 else None
 
         # === SmearGate ===
         self.smear = SmearGate(model_dim)
@@ -561,6 +574,9 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         n = self.num_layers
         x = self.tok_emb(input_ids)
+        if self.bigram is not None:
+            b_emb = self.bigram(input_ids)
+            x = x + F.pad(b_emb, (0, x.size(-1) - b_emb.size(-1)))
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
@@ -617,6 +633,9 @@ class GPT(nn.Module):
         """
         n = self.num_layers
         x = self.tok_emb(input_ids)
+        if self.bigram is not None:
+            b_emb = self.bigram(input_ids)
+            x = x + F.pad(b_emb, (0, x.size(-1) - b_emb.size(-1)))
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
@@ -1357,8 +1376,8 @@ import zlib
 from pathlib import Path
 
 try:
-    import zstandard
-    _COMPRESSOR = "zstd"
+    import lzma
+    _COMPRESSOR = "lzma"
 except ImportError:
     _COMPRESSOR = "zlib"
 
@@ -1377,7 +1396,7 @@ class Hyperparameters:
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 4000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -1412,19 +1431,19 @@ class Hyperparameters:
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
-    ve_layers = os.environ.get("VE_LAYERS", "9,10")
+    ve_layers = os.environ.get("VE_LAYERS", "2,4,6,8,10")
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 5))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
-    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
+    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 6))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
@@ -2056,8 +2075,8 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
-    if _COMPRESSOR == "zstd":
-        quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
+    if _COMPRESSOR == "lzma":
+        quant_blob = lzma.compress(quant_raw, preset=9)
     else:
         quant_blob = zlib.compress(quant_raw, 9)
 
@@ -2076,8 +2095,8 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    if _COMPRESSOR == "zstd":
-        decompressed = zstandard.ZstdDecompressor().decompress(quant_blob_disk)
+    if _COMPRESSOR == "lzma":
+        decompressed = lzma.decompress(quant_blob_disk)
     else:
         decompressed = zlib.decompress(quant_blob_disk)
     quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
