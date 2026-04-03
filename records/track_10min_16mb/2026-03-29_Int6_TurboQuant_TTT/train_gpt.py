@@ -1879,7 +1879,7 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
 
-    compiled_model = base_model
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if use_cuda else base_model
     model = compiled_model
 
     # --- Optimizers ---
