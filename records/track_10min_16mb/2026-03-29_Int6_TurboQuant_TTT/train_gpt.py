@@ -420,6 +420,7 @@ class GPT(nn.Module):
         ve_enabled: bool = True,
         ve_dim: int = 128,
         ve_layers: str = "9,10",
+        depth_recurrence: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -429,6 +430,11 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.num_layers = num_layers
+        self.depth_recurrence = depth_recurrence
+
+        # Depth recurrence: consecutive layer pairs share the same bank slice.
+        # num_unique = ceil(num_layers / 2) when enabled, else num_layers.
+        self.num_unique = (num_layers + 1) // 2 if depth_recurrence else num_layers
 
         # === Token Embedding ===
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
@@ -446,29 +452,26 @@ class GPT(nn.Module):
         )
 
         # === Parameter Banks ===
-        # All Q/K/V/O and MLP weights for every layer live in contiguous 3-D
-        # tensors.  This gives us:
-        #   1. Single NS5 call per bank in Muon optimizer
-        #   2. Single quantization pass per bank at checkpoint time
-        #   3. Natural weight tying if we want to share across layers later
+        # Banks are sized by num_unique (halved when depth_recurrence=True).
+        nu = self.num_unique
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
         mlp_dim = int(mlp_mult * model_dim)
 
-        # QO bank: layer i → Q weight, layer (n+i) → Out weight
+        # QO bank: unique slot i → Q weight, slot (nu+i) → Out weight
         self.qo_bank = nn.Parameter(
-            torch.empty(2 * num_layers, model_dim, model_dim)
+            torch.empty(2 * nu, model_dim, model_dim)
         )
-        # KV bank: layer i → K weight, layer (n+i) → V weight
+        # KV bank: unique slot i → K weight, slot (nu+i) → V weight
         self.kv_bank = nn.Parameter(
-            torch.empty(2 * num_layers, kv_dim, model_dim)
+            torch.empty(2 * nu, kv_dim, model_dim)
         )
         # MLP banks
         self.mlp_up_bank = nn.Parameter(
-            torch.empty(num_layers, mlp_dim, model_dim)
+            torch.empty(nu, mlp_dim, model_dim)
         )
         self.mlp_down_bank = nn.Parameter(
-            torch.empty(num_layers, model_dim, mlp_dim)
+            torch.empty(nu, model_dim, mlp_dim)
         )
 
         # === Transformer Blocks ===
@@ -524,25 +527,59 @@ class GPT(nn.Module):
         self._init_weights()
 
     # -----------------------------------------------------------------
+    def _bank_idx(self, layer: int) -> int:
+        """Map logical layer index to bank slot (halved under depth recurrence)."""
+        return layer // 2 if self.depth_recurrence else layer
+
+    # -----------------------------------------------------------------
+    @staticmethod
+    def _overtone_init(w: Tensor, gain: float = 1.0) -> None:
+        """Overtone Initialization: harmonic sinusoidal frequencies.
+
+        Each row is a superposition of sine waves at harmonics 1..K,
+        creating structured, spectrally-diverse initial features that
+        converge faster under Muon's Newton-Schulz orthogonalization.
+        """
+        rows, cols = w.shape[-2], w.shape[-1]
+        num_harmonics = min(8, cols // 2)
+        t = torch.linspace(0, 2 * math.pi, cols, device=w.device, dtype=torch.float32)
+        phases = torch.linspace(0, math.pi, rows, device=w.device, dtype=torch.float32)
+        with torch.no_grad():
+            acc = torch.zeros(rows, cols, device=w.device, dtype=torch.float32)
+            for k in range(1, num_harmonics + 1):
+                amp = 1.0 / k  # 1/f spectrum
+                acc += amp * torch.sin(k * t[None, :] + phases[:, None] * k)
+            # Normalize rows to unit norm, apply gain
+            norms = acc.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            if w.ndim == 3:
+                for b in range(w.shape[0]):
+                    w.data[b] = (acc * gain / norms).to(w.dtype)
+                    # Add small per-slice perturbation for diversity
+                    w.data[b] += 0.01 * torch.randn_like(w.data[b])
+            else:
+                w.data.copy_((acc * gain / norms).to(w.dtype))
+                w.data += 0.01 * torch.randn_like(w.data)
+
+    # -----------------------------------------------------------------
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(
                 self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std
             )
 
-        n = self.num_layers
-        proj_scale = 1.0 / math.sqrt(2 * n)
+        nu = self.num_unique
+        proj_scale = 1.0 / math.sqrt(2 * self.num_layers)
 
-        # Init parameter banks
-        for i in range(n):
-            nn.init.orthogonal_(self.qo_bank.data[i], gain=1.0)       # Q
-            nn.init.zeros_(self.qo_bank.data[n + i])                   # Out (zero)
-            nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)        # K
-            nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)    # V
-            nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)    # Up
+        # Overtone init for parameter banks
+        for i in range(nu):
+            self._overtone_init(self.qo_bank.data[i], gain=1.0)       # Q
+            nn.init.zeros_(self.qo_bank.data[nu + i])                  # Out (zero)
+            self._overtone_init(self.kv_bank.data[i], gain=1.0)        # K
+            self._overtone_init(self.kv_bank.data[nu + i], gain=1.0)   # V
+            self._overtone_init(self.mlp_up_bank.data[i], gain=1.0)    # Up
             nn.init.zeros_(self.mlp_down_bank.data[i])                 # Down (zero)
             # Scale projection layers
-            self.qo_bank.data[n + i].mul_(proj_scale)
+            self.qo_bank.data[nu + i].mul_(proj_scale)
             self.mlp_down_bank.data[i].mul_(proj_scale)
 
         # Init remaining nn.Linear modules (lm_head if untied)
@@ -555,7 +592,7 @@ class GPT(nn.Module):
                     and module.weight.shape[0] >= 64
                     and module.weight.shape[1] >= 64
                 ):
-                    nn.init.orthogonal_(module.weight, gain=1.0)
+                    self._overtone_init(module.weight, gain=1.0)
 
     # -----------------------------------------------------------------
     def _get_ve(
@@ -572,7 +609,7 @@ class GPT(nn.Module):
 
     # -----------------------------------------------------------------
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        n = self.num_layers
+        nu = self.num_unique
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             b_emb = self.bigram(input_ids)
@@ -586,25 +623,27 @@ class GPT(nn.Module):
 
         # Encoder half (collect skip connections)
         for i in range(self.num_encoder_layers):
+            bi = self._bank_idx(i)
             ve = self._get_ve(i, input_ids, ve_cache)
             x = self.blocks[i](
                 x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[nu + bi],
+                self.qo_bank[nu + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve,
             )
             skips.append(x)
 
         # Decoder half (consume skip connections in reverse)
         for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
+            li = self.num_encoder_layers + i
+            bk = self._bank_idx(li)
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](
+            ve = self._get_ve(li, input_ids, ve_cache)
+            x = self.blocks[li](
                 x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                self.qo_bank[bk], self.kv_bank[bk], self.kv_bank[nu + bk],
+                self.qo_bank[nu + bk], self.mlp_up_bank[bk], self.mlp_down_bank[bk],
                 v_embed=ve,
             )
 
@@ -631,7 +670,7 @@ class GPT(nn.Module):
 
         Used for sliding-window evaluation and generation.
         """
-        n = self.num_layers
+        nu = self.num_unique
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             b_emb = self.bigram(input_ids)
@@ -644,24 +683,26 @@ class GPT(nn.Module):
         ve_cache: dict = {}
 
         for i in range(self.num_encoder_layers):
+            bi = self._bank_idx(i)
             ve = self._get_ve(i, input_ids, ve_cache)
             x = self.blocks[i](
                 x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[nu + bi],
+                self.qo_bank[nu + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve,
             )
             skips.append(x)
 
         for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
+            li = self.num_encoder_layers + i
+            bk = self._bank_idx(li)
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](
+            ve = self._get_ve(li, input_ids, ve_cache)
+            x = self.blocks[li](
                 x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                self.qo_bank[bk], self.kv_bank[bk], self.kv_bank[nu + bk],
+                self.qo_bank[nu + bk], self.mlp_up_bank[bk], self.mlp_down_bank[bk],
                 v_embed=ve,
             )
 
@@ -1437,6 +1478,7 @@ class Hyperparameters:
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "2,4,6,8,10")
+    depth_recurrence = bool(int(os.environ.get("DEPTH_RECURRENCE", "0")))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
@@ -1680,22 +1722,33 @@ def _classify_param(name: str) -> str:
     return "other"
 
 
-def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
+def _quantize_intN_per_row(t: Tensor, clip_range: int) -> tuple[Tensor, Tensor]:
+    """Unified per-row quantization to [-clip_range, clip_range-1] (N-bit signed)."""
     t32 = t.float()
     if t32.ndim == 2:
         best_q, best_s, best_err = None, None, float('inf')
         for pct in [0.9990, 0.9995, 0.9999, 1.0]:
             row_clip = torch.quantile(t32.abs(), pct, dim=1) if pct < 1.0 else t32.abs().amax(dim=1)
             s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
-            q = torch.clamp(torch.round(t32 / s.float()[:, None]), -clip_range, clip_range).to(torch.int8)
+            q = torch.clamp(torch.round(t32 / s.float()[:, None]), -(clip_range + 1), clip_range).to(torch.int8)
             err = (t32 - q.float() * s.float()[:, None]).pow(2).mean().item()
             if err < best_err:
                 best_q, best_s, best_err = q, s, err
         return best_q, best_s
     amax = t32.abs().max().item()
     scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
-    q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
+    q = torch.clamp(torch.round(t32 / scale.float()), -(clip_range + 1), clip_range).to(torch.int8)
     return q, scale
+
+
+def quantize_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
+    """6-bit signed: [-32, 31]."""
+    return _quantize_intN_per_row(t, clip_range=31)
+
+
+def quantize_int5_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
+    """5-bit signed: [-16, 15]. More aggressive, ideal for robust MLP weights."""
+    return _quantize_intN_per_row(t, clip_range=15)
 
 
 def quantize_int8_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
@@ -1713,41 +1766,51 @@ def quantize_int8_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
     return q, s
 
 
-def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tensor]:
+def _unbank_state_dict(sd: dict[str, Tensor], num_unique: int, num_layers: int,
+                       depth_recurrence: bool = False) -> dict[str, Tensor]:
+    """Unbank 3-D tensors into per-layer 2-D weights for quantization."""
     out: dict[str, Tensor] = {}
-    n = num_layers
+    nu = num_unique
+    def bi(layer: int) -> int:
+        return layer // 2 if depth_recurrence else layer
     for name, tensor in sd.items():
         if name == "qo_bank":
-            for i in range(n):
-                out[f"blocks.{i}.attn.c_q.weight"] = tensor[i]
-                out[f"blocks.{i}.attn.proj.weight"] = tensor[n + i]
+            for i in range(num_layers):
+                out[f"blocks.{i}.attn.c_q.weight"] = tensor[bi(i)]
+                out[f"blocks.{i}.attn.proj.weight"] = tensor[nu + bi(i)]
         elif name == "kv_bank":
-            for i in range(n):
-                out[f"blocks.{i}.attn.c_k.weight"] = tensor[i]
-                out[f"blocks.{i}.attn.c_v.weight"] = tensor[n + i]
+            for i in range(num_layers):
+                out[f"blocks.{i}.attn.c_k.weight"] = tensor[bi(i)]
+                out[f"blocks.{i}.attn.c_v.weight"] = tensor[nu + bi(i)]
         elif name == "mlp_up_bank":
-            for i in range(n):
-                out[f"blocks.{i}.mlp.fc.weight"] = tensor[i]
+            for i in range(num_layers):
+                out[f"blocks.{i}.mlp.fc.weight"] = tensor[bi(i)]
         elif name == "mlp_down_bank":
-            for i in range(n):
-                out[f"blocks.{i}.mlp.proj.weight"] = tensor[i]
+            for i in range(num_layers):
+                out[f"blocks.{i}.mlp.proj.weight"] = tensor[bi(i)]
         else:
             out[name] = tensor
     return out
 
 
-def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
+def _rebank_state_dict(sd: dict[str, Tensor], num_unique: int, num_layers: int,
+                       template_sd: dict[str, Tensor],
+                       depth_recurrence: bool = False) -> dict[str, Tensor]:
+    """Re-bank per-layer 2-D weights back into 3-D bank tensors."""
     out: dict[str, Tensor] = {}
-    n = num_layers
-    qo = [None] * (2 * n); kv = [None] * (2 * n); up = [None] * n; dn = [None] * n
+    nu = num_unique
+    qo = [None] * (2 * nu); kv = [None] * (2 * nu); up = [None] * nu; dn = [None] * nu
     consumed = set()
-    for i in range(n):
+    def bi(layer: int) -> int:
+        return layer // 2 if depth_recurrence else layer
+    for i in range(num_layers):
+        b = bi(i)
         for key, lst, idx in [
-            (f"blocks.{i}.attn.c_q.weight", qo, i), (f"blocks.{i}.attn.proj.weight", qo, n+i),
-            (f"blocks.{i}.attn.c_k.weight", kv, i), (f"blocks.{i}.attn.c_v.weight", kv, n+i),
-            (f"blocks.{i}.mlp.fc.weight", up, i), (f"blocks.{i}.mlp.proj.weight", dn, i),
+            (f"blocks.{i}.attn.c_q.weight", qo, b), (f"blocks.{i}.attn.proj.weight", qo, nu+b),
+            (f"blocks.{i}.attn.c_k.weight", kv, b), (f"blocks.{i}.attn.c_v.weight", kv, nu+b),
+            (f"blocks.{i}.mlp.fc.weight", up, b), (f"blocks.{i}.mlp.proj.weight", dn, b),
         ]:
-            if key in sd:
+            if key in sd and lst[idx] is None:
                 lst[idx] = sd[key]; consumed.add(key)
     out["qo_bank"] = torch.stack(qo).to(dtype=template_sd["qo_bank"].dtype)
     out["kv_bank"] = torch.stack(kv).to(dtype=template_sd["kv_bank"].dtype)
@@ -1760,6 +1823,7 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
 
 
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
+    """Mixed precision: Int6 for attention, Int5 for MLPs, Int8 for rest."""
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     for name, tensor in state_dict.items():
@@ -1773,7 +1837,13 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             result[name] = t.float()
             meta[name] = "passthrough_ctrl"
             continue
-        if cat in int6_cats and t.ndim >= 1:
+        if cat == "mlp" and t.ndim >= 1:
+            # Int5 for MLPs — aggressive but MLPs are robust to quant noise
+            q, s = quantize_int5_per_row(t)
+            result[name + ".q"], result[name + ".scale"] = q, s
+            meta[name] = {"type": "int5"}
+        elif cat in int6_cats and t.ndim >= 1:
+            # Int6 for attention (delicate)
             q, s = quantize_int6_per_row(t)
             result[name + ".q"], result[name + ".scale"] = q, s
             meta[name] = {"type": "int6"}
@@ -1885,6 +1955,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+        depth_recurrence=args.depth_recurrence,
     ).to(device)
     if use_cuda:
         base_model = base_model.bfloat16()
@@ -2070,7 +2141,8 @@ def main() -> None:
 
     # Unbank → Int6 quantize → compress
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
+    unbanked_sd = _unbank_state_dict(sd_cpu, base_model.num_unique, args.num_layers,
+                                      depth_recurrence=args.depth_recurrence)
     quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"})
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
@@ -2101,7 +2173,8 @@ def main() -> None:
         decompressed = zlib.decompress(quant_blob_disk)
     quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
     deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_sd)
-    deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu)
+    deq_state = _rebank_state_dict(deq_unbanked, base_model.num_unique, args.num_layers,
+                                    sd_cpu, depth_recurrence=args.depth_recurrence)
 
     eval_model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
@@ -2110,6 +2183,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+        depth_recurrence=args.depth_recurrence,
     ).to(device)
     if use_cuda:
         eval_model = eval_model.bfloat16()
